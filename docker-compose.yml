@@ -1,5 +1,9 @@
 name: edge-gateway-demo
 
+# Two gateways share one SQLite database on the shared volume.  The session
+# binding, closed state and can-offline verdict therefore agree across both
+# gateways.  GATEWAY_ID must be distinct per gateway so each instance clears
+# only its own interrupted in-flight rows on restart.
 services:
   upstream-a:
     build: ./upstream
@@ -17,15 +21,30 @@ services:
     ports:
       - "9002:8000"
 
-  gateway:
+  gateway-a:
     build: ./gateway
     environment:
-      # 已登记的上游清单；启动时写入 SQLite，重启后按已登记路由接流量
+      GATEWAY_ID: gw-a
+      GATEWAY_DB: /data/gateway.db
       UPSTREAMS: "alpha=http://upstream-a:8000;beta=http://upstream-b:8000"
       INITIAL_TARGET: alpha
-      GATEWAY_DB: /data/gateway.db
     ports:
       - "8080:8000"
+    volumes:
+      - gateway-data:/data
+    depends_on:
+      - upstream-a
+      - upstream-b
+
+  gateway-b:
+    build: ./gateway
+    environment:
+      GATEWAY_ID: gw-b
+      GATEWAY_DB: /data/gateway.db
+      UPSTREAMS: "alpha=http://upstream-a:8000;beta=http://upstream-b:8000"
+      INITIAL_TARGET: alpha
+    ports:
+      - "8081:8000"
     volumes:
       - gateway-data:/data
     depends_on:

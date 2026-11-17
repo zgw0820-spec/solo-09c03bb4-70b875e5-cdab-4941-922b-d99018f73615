@@ -66,6 +66,10 @@ def phase1():
     check("初始当前目标为 alpha", st["route"]["current_target"] == "alpha")
     check("初始版号为 0", st["route"]["version"] == 0)
     check("初始无在途请求", len(st["inflight"]) == 0)
+    dead = upstream_of(st, "dead")
+    check("未接管过流量的备用目标不提示可下线",
+          dead["is_current"] is False and dead["is_old_target"] is False
+          and dead["can_offline"] is False, dead)
 
     # 1) slow request admitted to alpha, keeps running through the switch
     slow = {}
@@ -121,6 +125,9 @@ def phase1():
     s, pd = api("POST", "/api/switch/probe", {"target": "dead", "base_version": 1})
     check("探测不可达候选失败", pd["ok"] is False)
     _, st = api("GET", "/api/state")
+    check("探测失败的候选仍不可下线", upstream_of(st, "dead")["can_offline"] is False,
+          upstream_of(st, "dead"))
+    _, st = api("GET", "/api/state")
     check("探测失败后维持原路由 beta@v1",
           st["route"]["current_target"] == "beta" and st["route"]["version"] == 1)
     s, cd = api("POST", "/api/switch/commit",
@@ -164,7 +171,76 @@ def phase1():
     check("alpha 在途清零后提示可下线", upstream_of(st, "alpha")["can_offline"] is True)
     check("当前目标 beta 不标记可下线", upstream_of(st, "beta")["can_offline"] is False)
 
-    # 12) arm one in-flight request that the harness will interrupt with kill -9
+    # 12) session stickiness: first call binds the then-effective target and
+    #     later calls keep going there after a route switch.
+    s, o = api("POST", "/api/session/open", {})
+    sid = o["session"]["id"]
+    check("开启会话时不绑定目标", o["session"]["target"] is None, o["session"])
+    # current route is beta@v3 here
+    s, r1 = api("POST", "/api/call", {"session_id": sid, "delay_ms": 30})
+    check("会话首次接单绑定当时目标 beta", r1.get("target") == "beta"
+          and r1.get("session_bound_now") is True and r1["upstream"].get("seq") == 1, r1)
+    s, r2 = api("POST", "/api/call", {"session_id": sid, "delay_ms": 30})
+    check("会话第二次调用仍在 beta 且序号递增", r2.get("target") == "beta"
+          and r2["upstream"].get("upstream") == "beta" and r2["upstream"].get("seq") == 2, r2)
+
+    # switch route to alpha; the session must stay on beta, plain calls follow alpha
+    s, ps = api("POST", "/api/switch/probe", {"target": "alpha", "base_version": 3})
+    s, cs = api("POST", "/api/switch/commit",
+                {"target": "alpha", "base_version": 3, "probe_id": ps["probe_id"]})
+    check("再次切换到 alpha@v4", cs.get("ok") is True and cs.get("version") == 4, cs)
+    _, st = api("GET", "/api/state")
+    beta = upstream_of(st, "beta")
+    check("有未关闭绑定会话的旧目标不可下线",
+          beta["is_current"] is False and beta["can_offline"] is False
+          and beta["open_sessions"] >= 1, beta)
+    s, r3 = api("POST", "/api/call", {"session_id": sid, "delay_ms": 30})
+    check("切换后会话仍访问原目标 beta 且序号继续", r3.get("target") == "beta"
+          and r3["upstream"].get("upstream") == "beta" and r3["upstream"].get("seq") == 3, r3)
+    s, rn = api("POST", "/api/call", {"delay_ms": 30})
+    check("切换后无会话请求走新目标 alpha",
+          rn.get("target") == "alpha" and rn["upstream"].get("upstream") == "alpha", rn)
+
+    # close session while a slow call of it is in flight: the admitted one returns
+    slow_sess = {}
+
+    def slow_session_call():
+        slow_sess["status"], slow_sess["body"] = api(
+            "POST", "/api/call", {"session_id": sid, "delay_ms": 3000}
+        )
+
+    t2 = threading.Thread(target=slow_session_call, daemon=True)
+    t2.start()
+    wait_state(lambda s: any(x.get("session_id") == sid for x in s["inflight"]),
+               "会话请求进入在途")
+    s, sc = api("POST", "/api/session/close", {"session_id": sid})
+    check("关闭会话成功", s == 200 and sc.get("ok") is True, sc)
+    s, rc = api("POST", "/api/call", {"session_id": sid, "delay_ms": 10})
+    check("关闭后新请求被拒绝(session_closed)",
+          s == 409 and rc.get("error") == "session_closed", rc)
+    s, re = api("POST", "/api/session/open", {"session_id": sid})
+    check("已关闭会话不可重新开启", s == 409 and re.get("error") == "session_closed", re)
+    t2.join(timeout=15)
+    check("关闭前已接单的请求仍完整返回",
+          slow_sess.get("body", {}).get("ok") is True
+          and slow_sess["body"].get("target") == "beta"
+          and slow_sess["body"]["upstream"].get("seq") == 4, slow_sess.get("body"))
+    wait_state(lambda s: inflight_of(s, "beta") == 0, "beta 会话在途清零")
+    _, st = api("GET", "/api/state")
+    beta = upstream_of(st, "beta")
+    check("会话关闭且无在途后 beta 才可下线",
+          beta["can_offline"] is True and beta["open_sessions"] == 0, beta)
+    check("当前目标 alpha 不标记可下线", upstream_of(st, "alpha")["can_offline"] is False)
+    s, unk = api("POST", "/api/call", {"session_id": "no-such-session"})
+    check("未知会话返回 404", s == 404 and unk.get("error") == "session_not_found", unk)
+
+    # 13) bind a fresh session to alpha (current), arm it for the restart test
+    s, o2 = api("POST", "/api/session/open", {})
+    sid2 = o2["session"]["id"]
+    s, rb = api("POST", "/api/call", {"session_id": sid2, "delay_ms": 30})
+    check("新会话绑定当前目标 alpha", rb.get("target") == "alpha", rb)
+
+    # 14) arm one in-flight request that the harness will interrupt with kill -9
     def interrupted():
         try:
             api("POST", "/api/call", {"delay_ms": 15000})
@@ -172,10 +248,11 @@ def phase1():
             pass
 
     threading.Thread(target=interrupted, daemon=True).start()
-    wait_state(lambda s: inflight_of(s, "beta") == 1, "重启前 beta 在途为 1")
+    wait_state(lambda s: inflight_of(s, "alpha") == 1, "重启前 alpha 在途为 1")
     with open(SAVE, "w") as f:
-        json.dump({"target": "beta", "version": 3}, f)
-    print("PHASE1 READY: 已在 beta 上挂起 1 条在途请求，等待网关被杀")
+        json.dump({"target": "alpha", "version": 4,
+                   "session_id": sid2, "session_target": "alpha"}, f)
+    print("PHASE1 READY: 已在 alpha 上挂起 1 条在途请求，等待网关被杀")
 
     # keep the client connection open until the gateway is killed
     deadline = time.time() + 60
@@ -200,6 +277,19 @@ def phase2():
     s, r = api("POST", "/api/call", {"delay_ms": 50})
     check("重启后新请求正常发往已登记目标",
           r["target"] == saved["target"] and r["ok"] is True)
+    # Unclosed sessions must survive the restart with their binding intact.
+    sid = saved["session_id"]
+    sess = next((x for x in st["sessions"] if x["id"] == sid), None)
+    check("重启后未关闭会话仍保留且绑定不变",
+          sess is not None and sess["status"] == "open" and sess["target"] == saved["session_target"],
+          sess)
+    s, r = api("POST", "/api/call", {"session_id": sid, "delay_ms": 30})
+    check("重启后会话仍由原绑定目标服务",
+          r.get("ok") is True and r.get("target") == saved["session_target"], r)
+    s, c = api("POST", "/api/session/close", {"session_id": sid})
+    check("重启后可关闭存活的会话", s == 200 and c.get("ok") is True, c)
+    s, r = api("POST", "/api/call", {"session_id": sid, "delay_ms": 10})
+    check("关闭后不再接纳该会话新请求", s == 409 and r.get("error") == "session_closed", r)
 
 
 if PHASE == "phase1":

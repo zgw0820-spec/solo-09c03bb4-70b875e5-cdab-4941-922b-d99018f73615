@@ -8,6 +8,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="${WORK_DIR:-/tmp/edge-gw-demo}"
 SAVE="$WORK/phase1.json"
 PY="${PYTHON:-python3}"
+# 允许通过 PYTHONPATH 使用本地已安装依赖（本环境无 pip 时可用）
+export PYTHONPATH="${LOCAL_PYTHONPATH:-${PYTHONPATH:-}}"
 GW_PORT="${GW_PORT:-8000}"
 UP_A_PORT="${UP_A_PORT:-9001}"
 UP_B_PORT="${UP_B_PORT:-9002}"
@@ -65,7 +67,7 @@ for _ in $(seq 1 300); do [ -f "$SAVE" ] && break; sleep 0.1; done
 [ -f "$SAVE" ] || { echo "phase1 未到达重启点" >&2; exit 1; }
 
 GW_PID="${PIDS[-1]}"
-echo "== kill -9 网关（模拟崩溃，beta 上仍有 1 条在途请求） =="
+echo "== kill -9 网关（模拟崩溃，alpha 上仍有 1 条在途请求） =="
 kill -9 "$GW_PID" 2>/dev/null || true
 wait "$SMOKE"
 
